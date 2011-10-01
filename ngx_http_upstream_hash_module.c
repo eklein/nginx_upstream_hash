@@ -11,6 +11,10 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+#if (NGX_HTTP_HEALTHCHECK)
+#include <ngx_http_healthcheck_module.h>
+#endif
+
 #define ngx_bitvector_index(index) (index / (8 * sizeof(uintptr_t)))
 #define ngx_bitvector_bit(index) ((uintptr_t) 1 << (index % (8 * sizeof(uintptr_t))))
 
@@ -18,10 +22,12 @@ typedef struct {
     struct sockaddr                *sockaddr;
     socklen_t                       socklen;
     ngx_str_t                       name;
-    ngx_uint_t                      down;
-#if (NGX_HTTP_SSL)
-    ngx_ssl_session_t              *ssl_session;   /* local to a process */
+    unsigned                        down:1;
+
+#if (NGX_HTTP_HEALTHCHECK)
+    ngx_int_t                       health_index;
 #endif
+
 } ngx_http_upstream_hash_peer_t;
 
 typedef struct {
@@ -31,7 +37,7 @@ typedef struct {
 
 typedef struct {
     ngx_http_upstream_hash_peers_t   *peers;
-    uint32_t                          hash;
+    ngx_uint_t                        hash;
     ngx_str_t                         current_key;
     ngx_str_t                         original_key;
     ngx_uint_t                        try_i;
@@ -47,12 +53,6 @@ static ngx_int_t ngx_http_upstream_get_hash_peer(ngx_peer_connection_t *pc,
     void *data);
 static void ngx_http_upstream_free_hash_peer(ngx_peer_connection_t *pc,
     void *data, ngx_uint_t state);
-#if (NGX_HTTP_SSL)
-static ngx_int_t ngx_http_upstream_set_hash_peer_session(ngx_peer_connection_t *pc,
-    void *data);
-static void ngx_http_upstream_save_hash_peer_session(ngx_peer_connection_t *pc,
-    void *data);
-#endif
 static char *ngx_http_upstream_hash(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_upstream_hash_again(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -60,7 +60,8 @@ static char *ngx_http_upstream_hash_again(ngx_conf_t *cf, ngx_command_t *cmd,
 static ngx_int_t ngx_http_upstream_init_hash(ngx_conf_t *cf,
     ngx_http_upstream_srv_conf_t *us);
 static ngx_uint_t ngx_http_upstream_hash_crc32(u_char *keydata, size_t keylen);
-
+static ngx_int_t ngx_http_upstream_is_down(ngx_http_upstream_hash_peer_t *peer,
+    ngx_log_t *log);
 
 static ngx_command_t  ngx_http_upstream_hash_commands[] = {
     { ngx_string("hash"),
@@ -119,6 +120,10 @@ ngx_http_upstream_init_hash(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     ngx_http_upstream_server_t      *server;
     ngx_http_upstream_hash_peers_t  *peers;
 
+#if (NGX_HTTP_HEALTHCHECK)
+    ngx_int_t                        health_index;
+#endif
+
     us->peer.init = ngx_http_upstream_init_hash_peer;
 
     if (!us->servers) {
@@ -148,6 +153,19 @@ ngx_http_upstream_init_hash(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
             peers->peer[n].socklen = server[i].addrs[j].socklen;
             peers->peer[n].name = server[i].addrs[j].name;
             peers->peer[n].down = server[i].down;
+
+#if (NGX_HTTP_HEALTHCHECK)
+            if (!server[i].down) {
+                health_index =
+                    ngx_http_healthcheck_add_peer(us,
+                    &server[i].addrs[j], cf->pool);
+                if (health_index == NGX_ERROR) {
+                    return NGX_ERROR;
+                }
+                peers->peer[n].health_index = health_index;
+            }
+#endif
+
         }
     }
 
@@ -184,10 +202,6 @@ ngx_http_upstream_init_hash_peer(ngx_http_request_t *r,
     r->upstream->peer.free = ngx_http_upstream_free_hash_peer;
     r->upstream->peer.get = ngx_http_upstream_get_hash_peer;
     r->upstream->peer.tries = us->retries + 1;
-#if (NGX_HTTP_SSL)
-    r->upstream->peer.set_session = ngx_http_upstream_set_hash_peer_session;
-    r->upstream->peer.save_session = ngx_http_upstream_save_hash_peer_session;
-#endif
 
     /* must be big enough for the retry keys */
     if ((uhpd->current_key.data = ngx_pcalloc(r->pool, NGX_ATOMIC_T_LEN + val.len)) == NULL) {
@@ -197,16 +211,11 @@ ngx_http_upstream_init_hash_peer(ngx_http_request_t *r,
     ngx_memcpy(uhpd->current_key.data, val.data, val.len);
     uhpd->current_key.len = val.len;
     uhpd->original_key = val;
-    uhpd->hash = ngx_http_upstream_hash_crc32(uhpd->current_key.data, uhpd->current_key.len);
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-            "upstream_hash: hashed \"%V\" to %ui", &uhpd->current_key, uhpd->hash % uhpd->peers->number);
     uhpd->try_i = 0;
 
-    /* In case this one is marked down */
     ngx_http_upstream_hash_next_peer(uhpd, &r->upstream->peer.tries, r->connection->log);
-
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-            "upstream_hash: Starting with %ui", uhpd->hash % uhpd->peers->number);
+                   "upstream_hash: Starting with %ui", uhpd->hash % uhpd->peers->number);
 
 
     return NGX_OK;
@@ -222,6 +231,12 @@ ngx_http_upstream_get_hash_peer(ngx_peer_connection_t *pc, void *data)
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
                    "upstream_hash: get upstream request hash peer try %ui", pc->tries);
+
+#if (NGX_HTTP_HEALTHCHECK)
+    if (pc->tries == 0) {
+        return NGX_BUSY;
+    }
+#endif
 
     pc->cached = 0;
     pc->connection = NULL;
@@ -265,87 +280,12 @@ ngx_http_upstream_free_hash_peer(ngx_peer_connection_t *pc, void *data,
     }
 }
 
-#if (NGX_HTTP_SSL)
-static ngx_int_t
-ngx_http_upstream_set_hash_peer_session(ngx_peer_connection_t *pc, void *data) {
-    ngx_http_upstream_hash_peer_data_t  *uhpd = data;
-
-    ngx_int_t                       rc;
-    ngx_ssl_session_t              *ssl_session;
-    ngx_http_upstream_hash_peer_t  *peer;
-    ngx_uint_t                           current;
-
-    current = uhpd->hash % uhpd->peers->number;
-
-    peer = &uhpd->peers->peer[current];
-
-    /* TODO: threads only mutex */
-    /* ngx_lock_mutex(rrp->peers->mutex); */
-
-    ssl_session = peer->ssl_session;
-
-    rc = ngx_ssl_set_session(pc->connection, ssl_session);
-
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
-                   "set session: %p:%d",
-                   ssl_session, ssl_session ? ssl_session->references : 0);
-
-    /* ngx_unlock_mutex(rrp->peers->mutex); */
-
-    return rc;
-}
-
-static void
-ngx_http_upstream_save_hash_peer_session(ngx_peer_connection_t *pc, void *data) {
-    ngx_http_upstream_hash_peer_data_t *uhpd = data;
-    ngx_ssl_session_t            *old_ssl_session, *ssl_session;
-    ngx_http_upstream_hash_peer_t  *peer;
-    ngx_uint_t                           current;
-
-    ssl_session = ngx_ssl_get_session(pc->connection);
-
-    if (ssl_session == NULL) {
-        return;
-    }
-
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
-                   "save session: %p:%d", ssl_session, ssl_session->references);
-
-    current = uhpd->hash % uhpd->peers->number;
-
-    peer = &uhpd->peers->peer[current];
-
-    /* TODO: threads only mutex */
-    /* ngx_lock_mutex(rrp->peers->mutex); */
-
-    old_ssl_session = peer->ssl_session;
-    peer->ssl_session = ssl_session;
-
-    /* ngx_unlock_mutex(rrp->peers->mutex); */
-
-    if (old_ssl_session) {
-
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
-                       "old session: %p:%d",
-                       old_ssl_session, old_ssl_session->references);
-
-        /* TODO: may block */
-
-        ngx_ssl_free_session(old_ssl_session);
-    }
-}
-#endif
-
 static void ngx_http_upstream_hash_next_peer(ngx_http_upstream_hash_peer_data_t *uhpd,
         ngx_uint_t *tries, ngx_log_t *log) {
 
     ngx_uint_t current;
     current = uhpd->hash % uhpd->peers->number;
-    //  Loop while there is a try left, we're on one we haven't tried, and
-    // the current peer isn't marked down
-    while ((*tries)-- && (
-       (uhpd->tried[ngx_bitvector_index(current)] & ngx_bitvector_bit(current))
-        || uhpd->peers->peer[current].down)) {
+    do {
        uhpd->current_key.len = ngx_sprintf(uhpd->current_key.data, "%d%V",
            ++uhpd->try_i, &uhpd->original_key) - uhpd->current_key.data;
        uhpd->hash += ngx_http_upstream_hash_crc32(uhpd->current_key.data,
@@ -353,7 +293,20 @@ static void ngx_http_upstream_hash_next_peer(ngx_http_upstream_hash_peer_data_t 
        current = uhpd->hash % uhpd->peers->number;
        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0,
            "upstream_hash: hashed \"%V\" to %ui", &uhpd->current_key, current);
-   } 
+       //   Loop while there is a try left, we're on one we haven't tried, and
+       // the current peer isn't marked down
+   } while (--(*tries) && (
+       (uhpd->tried[ngx_bitvector_index(current)] & ngx_bitvector_bit(current))
+        || ngx_http_upstream_is_down(&uhpd->peers->peer[current], log)));
+}
+
+static ngx_int_t ngx_http_upstream_is_down(ngx_http_upstream_hash_peer_t *peer,
+    ngx_log_t *log) {
+  return peer->down
+#if (NGX_HTTP_HEALTHCHECK)
+                    || ngx_http_healthcheck_is_down(peer->health_index, log)
+#endif
+    ;
 }
 
 /* bit-shift, bit-mask, and non-zero requirement are for libmemcache compatibility */

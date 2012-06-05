@@ -283,6 +283,10 @@ ngx_http_upstream_free_hash_peer(ngx_peer_connection_t *pc, void *data,
 static void ngx_http_upstream_hash_next_peer(ngx_http_upstream_hash_peer_data_t *uhpd,
         ngx_uint_t *tries, ngx_log_t *log) {
 
+#if (NGX_HTTP_HEALTHCHECK)
+    ngx_uint_t i, j, active_count;
+#endif
+
     ngx_uint_t current;
     current = uhpd->hash % uhpd->peers->number;
     do {
@@ -297,7 +301,58 @@ static void ngx_http_upstream_hash_next_peer(ngx_http_upstream_hash_peer_data_t 
        // the current peer isn't marked down
    } while (--(*tries) && (
        (uhpd->tried[ngx_bitvector_index(current)] & ngx_bitvector_bit(current))
-        || ngx_http_upstream_is_down(&uhpd->peers->peer[current], log)));
+#if (NGX_HTTP_HEALTHCHECK)
+        || ngx_http_upstream_is_down(&uhpd->peers->peer[current], log)
+#endif
+        ));
+
+#if (NGX_HTTP_HEALTHCHECK)
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0,
+                 "upstream_hash: tries: %ui is_down: %ui",
+                 *tries,
+                 ngx_http_upstream_is_down(&uhpd->peers->peer[current], log));
+
+    if ( *tries == 0 &&
+            ngx_http_upstream_is_down(&uhpd->peers->peer[current], log)) {
+
+        active_count = 0;
+        for (i = 0; i < uhpd->peers->number; ++i) {
+            if (!(uhpd->tried[ngx_bitvector_index(i)] & ngx_bitvector_bit(i)
+                || ngx_http_upstream_is_down(&uhpd->peers->peer[i], log))) {
+
+                ++active_count;
+            }
+        }
+
+        if (active_count != 0) {
+            uhpd->current_key.len = ngx_sprintf(uhpd->current_key.data, "%d%V",
+                ++uhpd->try_i, &uhpd->original_key) - uhpd->current_key.data;
+
+            uhpd->hash += ngx_http_upstream_hash_crc32(uhpd->current_key.data,
+                uhpd->current_key.len);
+
+            current = uhpd->hash % active_count;
+
+            j = 0;
+            for (i = 0; i < uhpd->peers->number; ++i) {
+                if (!(uhpd->tried[ngx_bitvector_index(i)] & ngx_bitvector_bit(i)
+                    || ngx_http_upstream_is_down(&uhpd->peers->peer[i], log))) {
+
+                    if (j == current) {
+                        uhpd->hash = i;
+                        *tries = 1;
+                        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
+                            "upstream_hash: rehashed healthcheck down peer to %ui",
+                            current);
+                        break;
+                    }
+                    ++j;
+                }
+            }
+        }
+    }
+#endif
+
 }
 
 static ngx_int_t ngx_http_upstream_is_down(ngx_http_upstream_hash_peer_t *peer,
